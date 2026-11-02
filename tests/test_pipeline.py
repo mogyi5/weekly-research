@@ -3,6 +3,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
+from google import genai
+from google.genai import errors as genai_errors
 
 from src import config, db, fetchers, main, synthesizer
 
@@ -266,6 +268,69 @@ def test_github_omits_auth_header_without_token(monkeypatch):
 
 
 # --- Synthesizer ---
+
+
+def api_error(code):
+    return genai_errors.APIError(code, {"error": {"code": code, "message": "x", "status": "x"}})
+
+
+@pytest.fixture
+def gemini(monkeypatch):
+    """Returns the mocked generate_content and the mocked sleep."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    client = MagicMock()
+    monkeypatch.setattr(genai, "Client", MagicMock(return_value=client))
+    sleep = MagicMock()
+    monkeypatch.setattr(synthesizer.time, "sleep", sleep)
+    return client.models.generate_content, sleep
+
+
+def models_called(generate):
+    return [call.kwargs["model"] for call in generate.call_args_list]
+
+
+def test_gemini_retries_with_growing_delays(gemini):
+    generate, sleep = gemini
+    generate.side_effect = [api_error(503), api_error(503), MagicMock(text="ok")]
+
+    assert synthesizer._call_gemini("prompt") == "ok"
+
+    assert models_called(generate) == [config.GEMINI_MODEL] * 3
+    assert [call.args[0] for call in sleep.call_args_list] == [30, 60]
+
+
+def test_gemini_falls_back_when_primary_stays_unavailable(gemini):
+    generate, _ = gemini
+    attempts = config.LLM_MAX_ATTEMPTS
+    generate.side_effect = [api_error(503)] * attempts + [MagicMock(text="ok")]
+
+    assert synthesizer._call_gemini("prompt") == "ok"
+
+    assert models_called(generate) == [config.GEMINI_MODEL] * attempts + [
+        config.GEMINI_FALLBACK_MODELS[0]
+    ]
+
+
+def test_gemini_raises_when_every_model_is_unavailable(gemini):
+    generate, _ = gemini
+    generate.side_effect = api_error(503)
+
+    with pytest.raises(genai_errors.APIError):
+        synthesizer._call_gemini("prompt")
+
+    models = 1 + len(config.GEMINI_FALLBACK_MODELS)
+    assert generate.call_count == config.LLM_MAX_ATTEMPTS * models
+
+
+def test_gemini_does_not_retry_client_errors(gemini):
+    generate, sleep = gemini
+    generate.side_effect = api_error(401)
+
+    with pytest.raises(genai_errors.APIError):
+        synthesizer._call_gemini("prompt")
+
+    assert generate.call_count == 1
+    sleep.assert_not_called()
 
 
 def test_filter_uses_model_ranking_and_ignores_unknown_ids(monkeypatch):

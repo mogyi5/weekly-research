@@ -30,7 +30,10 @@ GITHUB_TOPICS = ["machine-learning"]
 GITHUB_RESULTS_PER_TOPIC = 30
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-LLM_MAX_ATTEMPTS = 3
-LLM_RETRY_DELAY_SECONDS = 20
+GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash"]
+# Runs only happen twice a month, so wait out demand spikes: 30s, 60s, then 120s
+# per model. The worst case still fits the workflow's 20 minute timeout.
+LLM_MAX_ATTEMPTS = 4
+LLM_RETRY_DELAY_SECONDS = 30
 SNIPPET_CHARS = 300
 MAX_DIGEST_ITEMS = 20

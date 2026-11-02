@@ -62,21 +62,28 @@ def _call_gemini(prompt: str, json_output: bool = False) -> str:
     generation_config = types.GenerateContentConfig(
         response_mime_type="application/json" if json_output else "text/plain"
     )
-    for attempt in range(1, config.LLM_MAX_ATTEMPTS + 1):
-        try:
-            response = client.models.generate_content(
-                model=config.GEMINI_MODEL, contents=prompt, config=generation_config
-            )
+    last_error = None
+    for model in [config.GEMINI_MODEL, *config.GEMINI_FALLBACK_MODELS]:
+        for attempt in range(config.LLM_MAX_ATTEMPTS):
+            if attempt:
+                time.sleep(config.LLM_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=prompt, config=generation_config
+                )
+            except errors.APIError as exc:
+                if exc.code != 429 and exc.code < 500:
+                    raise
+                last_error = exc
+                logger.warning(
+                    "%s failed with %s (attempt %d of %d)",
+                    model, exc.code, attempt + 1, config.LLM_MAX_ATTEMPTS,
+                )
+                continue
             if not response.text:
                 raise ValueError("Gemini returned an empty response")
             return response.text
-        except errors.APIError as exc:
-            retryable = exc.code == 429 or exc.code >= 500
-            if not retryable or attempt == config.LLM_MAX_ATTEMPTS:
-                raise
-            logger.warning("Gemini call failed (%s), retrying", exc.code)
-            time.sleep(config.LLM_RETRY_DELAY_SECONDS)
-    raise AssertionError("unreachable")
+    raise last_error
 
 
 def _snippets(items: list[dict]) -> str:
