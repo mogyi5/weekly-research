@@ -23,6 +23,8 @@ FILTER_PROMPT = f"""You curate a research digest for machine learning practition
 {UNTRUSTED_NOTE}
 
 Discard purely promotional spam, beginner help questions, and zero-context links.
+"score" is GitHub stars or Reddit or Hugging Face upvotes. arXiv items have a score
+of 0 because arXiv has no votes, which does not mean they are low quality.
 Return a JSON array of the "id" values of the items worth keeping, ranked from
 highest signal to lowest. Return only the JSON array.
 
@@ -41,8 +43,9 @@ Exactly 3 bullets giving the macro takeaways of the fortnight.
 For each repository: repo name, primary language, problem solved, link.
 
 ## Research & Papers
-For each paper: title, core empirical speedup or finding, practical constraints,
-arXiv link.
+Items with source "arxiv" or "huggingface" are papers. For each paper: title, core
+empirical speedup or finding, practical constraints, arXiv link. For "huggingface"
+items, also give the upvote count from "score".
 
 ## Community Signals
 Key discussions or debates, with links.
@@ -202,8 +205,8 @@ def select_top(ranked: list[dict], limit: int | None = None) -> list[dict]:
 
 
 def _mock_digest(items: list[dict]) -> str:
-    def entries(source: str) -> str:
-        lines = [f"- [{i['title']}]({i['url']})" for i in items if i["source"] == source]
+    def entries(*sources: str) -> str:
+        lines = [f"- [{i['title']}]({i['url']})" for i in items if i["source"] in sources]
         return "\n".join(lines) or "No items."
 
     return f"""> **Mock digest.** GEMINI_API_KEY was not set, so nothing below was filtered or summarized by a model.
@@ -217,7 +220,7 @@ def _mock_digest(items: list[dict]) -> str:
 {entries("github")}
 
 ## Research & Papers
-{entries("arxiv")}
+{entries("arxiv", "huggingface")}
 
 ## Community Signals
 {entries("reddit")}

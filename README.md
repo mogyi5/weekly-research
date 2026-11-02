@@ -1,6 +1,6 @@
 # Bi-Weekly Research Digest
 
-Runs on the 1st and 15th of each month via GitHub Actions, with a backup run the next day if no digest was produced. It collects recent items from arXiv, Reddit and GitHub, skips anything already recorded in `data/digest_cache.db`, filters and summarizes the rest with Gemini, and commits a report to `digests/digest_YYYY-MM-DD.md`.
+Runs on the 1st and 15th of each month via GitHub Actions, with a backup run the next day if no digest was produced. It collects recent items from arXiv, Hugging Face Daily Papers, Reddit and GitHub, skips anything already recorded in `data/digest_cache.db`, filters and summarizes the rest with Gemini, and commits a report to `digests/digest_YYYY-MM-DD.md`.
 
 ## Setup
 

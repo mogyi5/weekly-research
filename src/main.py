@@ -29,6 +29,16 @@ def collect_items() -> tuple[list[dict], list[str]]:
     return list(items.values()), failed
 
 
+def unique_by_url(items: list[dict]) -> list[dict]:
+    """A paper can arrive from both arXiv and Hugging Face; keep the one with votes."""
+    best: dict[str, dict] = {}
+    for item in items:
+        current = best.get(item["url"])
+        if current is None or item["score"] > current["score"]:
+            best[item["url"]] = item
+    return list(best.values())
+
+
 def write_digest(body: str, failed_sources: list[str], deferred: int = 0) -> Path:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     config.DIGESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -71,13 +81,17 @@ def main() -> int:
     if not new_items:
         logger.info("No new items found; nothing to do")
         return 0
-    logger.info("%d new items out of %d fetched", len(new_items), len(items))
+    candidates = unique_by_url(new_items)
+    logger.info(
+        "%d new items out of %d fetched, %d after removing overlaps",
+        len(new_items), len(items), len(candidates),
+    )
 
     # Nothing is marked as seen until the digest is saved, so a failed LLM call
     # leaves these items available to the next run.
     try:
-        kept, assessed = synthesizer.filter_items(new_items)
-        deferred = len(new_items) - len(assessed)
+        kept, assessed = synthesizer.filter_items(candidates)
+        deferred = len(candidates) - len(assessed)
         if kept:
             selected = synthesizer.select_top(kept)
             logger.info("Kept %d items, using %d", len(kept), len(selected))
@@ -89,8 +103,11 @@ def main() -> int:
         logger.exception("Synthesis failed; items left unmarked for the next run")
         return 1
 
-    db.mark_items_seen(assessed)
-    logger.info("Marked %d items as seen, left %d for next run", len(assessed), deferred)
+    # Mark overlapping copies too, so the arXiv copy cannot resurface next run.
+    assessed_urls = {item["url"] for item in assessed}
+    seen = [item for item in new_items if item["url"] in assessed_urls]
+    db.mark_items_seen(seen)
+    logger.info("Marked %d items as seen, left %d for next run", len(seen), deferred)
     return 0
 
 

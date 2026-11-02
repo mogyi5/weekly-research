@@ -91,6 +91,34 @@ def fetch_arxiv() -> list[dict]:
     return _fetch_each(days, fetch_day, "arXiv")
 
 
+def _fetch_huggingface_day(day: datetime) -> list[dict]:
+    params = {"date": day.strftime("%Y-%m-%d"), "limit": 100}
+    entries = _get(config.HUGGINGFACE_API_URL, params=params).json()
+
+    papers = [entry["paper"] for entry in entries]
+    popular = [p for p in papers if p.get("upvotes", 0) >= config.HUGGINGFACE_MIN_UPVOTES]
+    popular.sort(key=lambda p: p["upvotes"], reverse=True)
+    return [
+        {
+            "id": f"huggingface:{paper['id']}",
+            "source": "huggingface",
+            "title": _clean(paper["title"]),
+            # Same URL as the arXiv fetcher, which is how main spots the overlap.
+            "url": f"https://arxiv.org/abs/{paper['id']}",
+            "summary": _clean(paper.get("summary", "")),
+            "score": paper["upvotes"],
+            "published_at": paper.get("publishedAt", ""),
+        }
+        for paper in popular[: config.HUGGINGFACE_TOP_PER_DAY]
+    ]
+
+
+def fetch_huggingface() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    days = [now - timedelta(days=n) for n in range(config.LOOKBACK_DAYS + 1)]
+    return _fetch_each(days, _fetch_huggingface_day, "Hugging Face")
+
+
 def _get_reddit_token() -> str:
     client_id = os.getenv("REDDIT_CLIENT_ID")
     client_secret = os.getenv("REDDIT_CLIENT_SECRET")
@@ -178,4 +206,9 @@ def fetch_github() -> list[dict]:
     return _fetch_each(config.GITHUB_TOPICS, _fetch_github_topic, "GitHub")
 
 
-FETCHERS = {"arxiv": fetch_arxiv, "reddit": fetch_reddit, "github": fetch_github}
+FETCHERS = {
+    "arxiv": fetch_arxiv,
+    "huggingface": fetch_huggingface,
+    "reddit": fetch_reddit,
+    "github": fetch_github,
+}

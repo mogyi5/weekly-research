@@ -129,6 +129,51 @@ def test_arxiv_error_entry_raises_when_every_request_fails(monkeypatch):
         fetchers.fetch_arxiv()
 
 
+# --- Hugging Face ---
+
+
+def hf_entry(paper_id, upvotes):
+    return {
+        "title": "Outer title",
+        "paper": {
+            "id": paper_id,
+            "title": f"Paper {paper_id}",
+            "summary": "An abstract.",
+            "upvotes": upvotes,
+            "publishedAt": "2026-10-30T00:00:00.000Z",
+        },
+    }
+
+
+def test_huggingface_keeps_most_upvoted_above_threshold(monkeypatch):
+    monkeypatch.setattr(config, "LOOKBACK_DAYS", 0)
+    monkeypatch.setattr(config, "HUGGINGFACE_TOP_PER_DAY", 2)
+    payload = [
+        hf_entry("low", config.HUGGINGFACE_MIN_UPVOTES - 1),
+        hf_entry("third", 10),
+        hf_entry("first", 90),
+        hf_entry("second", 40),
+    ]
+    get = MagicMock(return_value=json_response(payload))
+    monkeypatch.setattr(fetchers.requests, "get", get)
+
+    items = fetchers.fetch_huggingface()
+
+    assert [i["id"] for i in items] == ["huggingface:first", "huggingface:second"]
+    assert set(items[0]) == ITEM_KEYS
+    assert items[0]["score"] == 90
+    assert items[0]["url"] == "https://arxiv.org/abs/first"
+    assert "date" in get.call_args.kwargs["params"]
+
+
+def test_huggingface_covers_every_day_and_tolerates_empty_days(monkeypatch):
+    get = MagicMock(return_value=json_response([]))
+    monkeypatch.setattr(fetchers.requests, "get", get)
+
+    assert fetchers.fetch_huggingface() == []
+    assert get.call_count == config.LOOKBACK_DAYS + 1
+
+
 # --- Reddit ---
 
 
@@ -574,6 +619,48 @@ def test_main_marks_assessed_items_when_filter_discards_all(monkeypatch):
 
     assert db.is_item_seen("arxiv:spam")
     assert digests() == []
+
+
+def overlapping_paper():
+    arxiv = {**make_item("arxiv:1", "arxiv", 0), "url": "https://arxiv.org/abs/1"}
+    hf = {**make_item("huggingface:1", "huggingface", 50), "url": "https://arxiv.org/abs/1"}
+    return arxiv, hf
+
+
+def test_main_sends_overlapping_paper_once_with_its_votes(monkeypatch):
+    arxiv, hf = overlapping_paper()
+    use_fetchers(monkeypatch, arxiv=lambda: [arxiv], huggingface=lambda: [hf])
+    seen_by_filter = []
+
+    def capture(items):
+        seen_by_filter.extend(items)
+        return items, items
+
+    monkeypatch.setattr(synthesizer, "filter_items", capture)
+
+    assert main.main() == 0
+
+    assert [i["id"] for i in seen_by_filter] == ["huggingface:1"]
+    assert db.is_item_seen("huggingface:1")
+    assert db.is_item_seen("arxiv:1")
+
+
+def test_main_leaves_both_copies_unmarked_when_deferred(monkeypatch):
+    arxiv, hf = overlapping_paper()
+    other = make_item("arxiv:2")
+    use_fetchers(monkeypatch, arxiv=lambda: [arxiv, other], huggingface=lambda: [hf])
+    monkeypatch.setattr(synthesizer, "filter_items", lambda _items: ([other], [other]))
+
+    assert main.main() == 0
+
+    assert not db.is_item_seen("arxiv:1")
+    assert not db.is_item_seen("huggingface:1")
+
+
+def test_mock_digest_lists_huggingface_items_as_papers():
+    digest = synthesizer.synthesize_digest([make_item("hf", "huggingface", 9)])
+    papers = digest.split("## Research & Papers")[1].split("## Community Signals")[0]
+    assert "Title hf" in papers
 
 
 def test_main_refuses_mock_digest_in_ci(monkeypatch):

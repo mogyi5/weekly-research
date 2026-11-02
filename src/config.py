@@ -19,7 +19,12 @@ ARXIV_CATEGORIES = ["cs.AI", "stat.ML"]
 ARXIV_RESULTS_PER_DAY = 25
 ARXIV_REQUEST_DELAY_SECONDS = 3  # arXiv asks for one request every 3 seconds
 
-REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+# Upvoted by readers, so this is the popularity signal arXiv itself lacks.
+HUGGINGFACE_API_URL = "https://huggingface.co/api/daily_papers"
+HUGGINGFACE_TOP_PER_DAY = 10
+HUGGINGFACE_MIN_UPVOTES = 5
+
+REDDIT_TOKEN_URL ="https://www.reddit.com/api/v1/access_token"
 REDDIT_API_URL = "https://oauth.reddit.com"
 REDDIT_SUBREDDITS = ["MachineLearning", "LocalLLaMA"]
 REDDIT_LIMIT = 30
