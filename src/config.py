@@ -32,8 +32,12 @@ GITHUB_RESULTS_PER_TOPIC = 30
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash"]
 # Runs only happen twice a month, so wait out demand spikes: 30s, 60s, then 120s
-# per model. The worst case still fits the workflow's 20 minute timeout.
+# per model.
 LLM_MAX_ATTEMPTS = 4
 LLM_RETRY_DELAY_SECONDS = 30
+# Give up on a stuck request and retry it, rather than waiting on the server.
+LLM_TIMEOUT_SECONDS = 180
+# A single request with every candidate ran for over 4 minutes and was dropped.
+FILTER_BATCH_SIZE = 40
 SNIPPET_CHARS = 300
 MAX_DIGEST_ITEMS = 20

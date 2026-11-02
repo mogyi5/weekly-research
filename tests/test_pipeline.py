@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 import requests
 from google import genai
@@ -320,6 +321,30 @@ def test_gemini_raises_when_every_model_is_unavailable(gemini):
 
     models = 1 + len(config.GEMINI_FALLBACK_MODELS)
     assert generate.call_count == config.LLM_MAX_ATTEMPTS * models
+
+
+@pytest.mark.parametrize(
+    "error", [httpx.RemoteProtocolError("dropped"), httpx.ReadTimeout("too slow")]
+)
+def test_gemini_retries_transport_errors(gemini, error):
+    generate, _ = gemini
+    generate.side_effect = [error, MagicMock(text="ok")]
+
+    assert synthesizer._call_gemini("prompt") == "ok"
+    assert generate.call_count == 2
+
+
+def test_filter_sends_batches_and_merges_ranks(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(config, "FILTER_BATCH_SIZE", 2)
+    responses = iter(['["b", "a"]', '["d", "c"]', '["e"]'])
+    call = MagicMock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(synthesizer, "_call_gemini", call)
+
+    kept = synthesizer.filter_items([make_item(i) for i in "abcde"])
+
+    assert call.call_count == 3
+    assert [i["id"] for i in kept] == ["b", "d", "e", "a", "c"]
 
 
 def test_gemini_does_not_retry_client_errors(gemini):

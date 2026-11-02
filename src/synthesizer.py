@@ -3,6 +3,9 @@ import json
 import logging
 import os
 import time
+from itertools import zip_longest
+
+import httpx
 
 from src import config
 
@@ -58,7 +61,10 @@ def _call_gemini(prompt: str, json_output: bool = False) -> str:
     from google import genai
     from google.genai import errors, types
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"],
+        http_options=types.HttpOptions(timeout=config.LLM_TIMEOUT_SECONDS * 1000),
+    )
     generation_config = types.GenerateContentConfig(
         response_mime_type="application/json" if json_output else "text/plain"
     )
@@ -71,13 +77,15 @@ def _call_gemini(prompt: str, json_output: bool = False) -> str:
                 response = client.models.generate_content(
                     model=model, contents=prompt, config=generation_config
                 )
-            except errors.APIError as exc:
-                if exc.code != 429 and exc.code < 500:
+            except (errors.APIError, httpx.TransportError) as exc:
+                # Transport errors (timeouts, dropped connections) have no status.
+                status = getattr(exc, "code", None)
+                if status is not None and status != 429 and status < 500:
                     raise
                 last_error = exc
                 logger.warning(
                     "%s failed with %s (attempt %d of %d)",
-                    model, exc.code, attempt + 1, config.LLM_MAX_ATTEMPTS,
+                    model, status or type(exc).__name__, attempt + 1, config.LLM_MAX_ATTEMPTS,
                 )
                 continue
             if not response.text:
@@ -108,6 +116,17 @@ def filter_items(items: list[dict]) -> list[dict]:
         logger.warning("GEMINI_API_KEY not set; mock mode, ranking by score only")
         return sorted(items, key=lambda i: i["score"], reverse=True)
 
+    size = config.FILTER_BATCH_SIZE
+    batches = [items[start : start + size] for start in range(0, len(items), size)]
+    ranked = []
+    for number, batch in enumerate(batches, 1):
+        logger.info("Filtering batch %d of %d", number, len(batches))
+        ranked.append(_filter_batch(batch))
+    # Ranks are only comparable within a batch, so take each batch's best in turn.
+    return [item for tier in zip_longest(*ranked) for item in tier if item is not None]
+
+
+def _filter_batch(items: list[dict]) -> list[dict]:
     kept_ids = json.loads(_call_gemini(FILTER_PROMPT + _snippets(items), json_output=True))
     by_id = {i["id"]: i for i in items}
     return [by_id[item_id] for item_id in dict.fromkeys(kept_ids) if item_id in by_id]
