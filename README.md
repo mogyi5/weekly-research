@@ -1,6 +1,6 @@
 # Bi-Weekly Research Digest
 
-Runs on the 1st and 15th of each month via GitHub Actions. It collects recent items from arXiv, Reddit and GitHub, skips anything already recorded in `data/digest_cache.db`, filters and summarizes the rest with Gemini, and commits a report to `digests/digest_YYYY-MM-DD.md`.
+Runs on the 1st and 15th of each month via GitHub Actions, with a backup run the next day if no digest was produced. It collects recent items from arXiv, Reddit and GitHub, skips anything already recorded in `data/digest_cache.db`, filters and summarizes the rest with Gemini, and commits a report to `digests/digest_YYYY-MM-DD.md`.
 
 ## Setup
 
@@ -33,7 +33,7 @@ Without `GEMINI_API_KEY`, the run writes a clearly labelled mock digest. **It st
 
 ## Configuration
 
-Sources, thresholds and limits are in `src/config.py`. Set `GEMINI_MODEL` in the environment to override the default model.
+Sources, thresholds and limits are in `src/config.py`. Set `GEMINI_MODEL` (digest) or `GEMINI_FILTER_MODEL` (filtering) in the environment to override the default models.
 
 ## Failure behaviour
 
@@ -42,5 +42,7 @@ Sources, thresholds and limits are in `src/config.py`. Set `GEMINI_MODEL` in the
 | No new items | Logs it and exits 0 with no digest |
 | One source fails | Digest is written and names the missing source in its footer |
 | All sources fail | Exits 1 |
-| Gemini call fails | Exits 1; items stay unmarked for the next run |
+| Gemini model overloaded | Retries, then switches to the next model for the rest of that phase |
+| Some filter batches fail | Digest is written from the rest; the footer gives the count, and those items stay unmarked for the next run |
+| Every filter batch fails, or the digest step fails | Exits 1; items stay unmarked and the backup run tries again |
 | Second run on the same day | Writes `digest_YYYY-MM-DD_2.md` rather than overwriting |

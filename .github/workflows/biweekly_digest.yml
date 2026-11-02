@@ -3,6 +3,8 @@ name: Bi-Weekly Research Digest
 on:
   schedule:
     - cron: "0 6 1,15 * *"
+    # Backup in case the main run failed; skipped if it produced a digest.
+    - cron: "0 6 2,16 * *"
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,7 @@ permissions:
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,8 +30,15 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run pipeline
-        run: python src/main.py
+        run: |
+          if [ "$SCHEDULE" = "0 6 2,16 * *" ] && \
+             [ -n "$(ls digests/digest_"$(date -u +%F)"*.md digests/digest_"$(date -u -d yesterday +%F)"*.md 2>/dev/null)" ]; then
+            echo "Main run already produced a digest; skipping backup run"
+            exit 0
+          fi
+          python src/main.py
         env:
+          SCHEDULE: ${{ github.event.schedule }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}

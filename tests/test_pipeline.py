@@ -290,14 +290,18 @@ def models_called(generate):
     return [call.kwargs["model"] for call in generate.call_args_list]
 
 
+def new_phase(*models, budget=1000):
+    return synthesizer._Phase.start(list(models or ("primary", "backup")), 60, budget)
+
+
 def test_gemini_retries_with_growing_delays(gemini):
     generate, sleep = gemini
     generate.side_effect = [api_error(503), api_error(503), MagicMock(text="ok")]
 
-    assert synthesizer._call_gemini("prompt") == "ok"
+    assert synthesizer._call_gemini("prompt", new_phase()) == "ok"
 
-    assert models_called(generate) == [config.GEMINI_MODEL] * 3
-    assert [call.args[0] for call in sleep.call_args_list] == [30, 60]
+    assert models_called(generate) == ["primary"] * 3
+    assert [call.args[0] for call in sleep.call_args_list] == [20, 40]
 
 
 def test_gemini_falls_back_when_primary_stays_unavailable(gemini):
@@ -305,22 +309,54 @@ def test_gemini_falls_back_when_primary_stays_unavailable(gemini):
     attempts = config.LLM_MAX_ATTEMPTS
     generate.side_effect = [api_error(503)] * attempts + [MagicMock(text="ok")]
 
-    assert synthesizer._call_gemini("prompt") == "ok"
+    assert synthesizer._call_gemini("prompt", new_phase()) == "ok"
 
-    assert models_called(generate) == [config.GEMINI_MODEL] * attempts + [
-        config.GEMINI_FALLBACK_MODELS[0]
-    ]
+    assert models_called(generate) == ["primary"] * attempts + ["backup"]
+
+
+def test_gemini_later_calls_skip_a_failed_model(gemini):
+    generate, _ = gemini
+    attempts = config.LLM_MAX_ATTEMPTS
+    generate.side_effect = [api_error(503)] * attempts + [MagicMock(text="ok")] * 2
+    phase = new_phase()
+
+    synthesizer._call_gemini("first", phase)
+    generate.reset_mock()
+    synthesizer._call_gemini("second", phase)
+
+    assert models_called(generate) == ["backup"]
 
 
 def test_gemini_raises_when_every_model_is_unavailable(gemini):
     generate, _ = gemini
     generate.side_effect = api_error(503)
 
-    with pytest.raises(genai_errors.APIError):
-        synthesizer._call_gemini("prompt")
+    with pytest.raises(synthesizer.ModelsUnavailable):
+        synthesizer._call_gemini("prompt", new_phase())
 
-    models = 1 + len(config.GEMINI_FALLBACK_MODELS)
-    assert generate.call_count == config.LLM_MAX_ATTEMPTS * models
+    assert generate.call_count == config.LLM_MAX_ATTEMPTS * 2
+
+
+def test_gemini_stops_when_time_budget_is_used(gemini):
+    generate, _ = gemini
+    phase = new_phase(budget=-1)
+
+    with pytest.raises(synthesizer.ModelsUnavailable, match="time budget"):
+        synthesizer._call_gemini("prompt", phase)
+
+    generate.assert_not_called()
+    assert phase.models == []
+
+
+def test_gemini_does_not_wait_past_the_budget(gemini):
+    generate, sleep = gemini
+    generate.side_effect = api_error(503)
+
+    with pytest.raises(synthesizer.ModelsUnavailable, match="time budget"):
+        synthesizer._call_gemini("prompt", new_phase(budget=config.LLM_RETRY_DELAY_SECONDS - 5))
+
+    assert generate.call_count == 1
+    sleep.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -330,21 +366,18 @@ def test_gemini_retries_transport_errors(gemini, error):
     generate, _ = gemini
     generate.side_effect = [error, MagicMock(text="ok")]
 
-    assert synthesizer._call_gemini("prompt") == "ok"
+    assert synthesizer._call_gemini("prompt", new_phase()) == "ok"
     assert generate.call_count == 2
 
 
-def test_filter_sends_batches_and_merges_ranks(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(config, "FILTER_BATCH_SIZE", 2)
-    responses = iter(['["b", "a"]', '["d", "c"]', '["e"]'])
-    call = MagicMock(side_effect=lambda *a, **k: next(responses))
-    monkeypatch.setattr(synthesizer, "_call_gemini", call)
+def test_gemini_moves_past_a_missing_model_without_retrying(gemini):
+    generate, sleep = gemini
+    generate.side_effect = [api_error(404), MagicMock(text="ok")]
 
-    kept = synthesizer.filter_items([make_item(i) for i in "abcde"])
+    assert synthesizer._call_gemini("prompt", new_phase()) == "ok"
 
-    assert call.call_count == 3
-    assert [i["id"] for i in kept] == ["b", "d", "e", "a", "c"]
+    assert models_called(generate) == ["primary", "backup"]
+    sleep.assert_not_called()
 
 
 def test_gemini_does_not_retry_client_errors(gemini):
@@ -352,10 +385,60 @@ def test_gemini_does_not_retry_client_errors(gemini):
     generate.side_effect = api_error(401)
 
     with pytest.raises(genai_errors.APIError):
-        synthesizer._call_gemini("prompt")
+        synthesizer._call_gemini("prompt", new_phase())
 
     assert generate.call_count == 1
     sleep.assert_not_called()
+
+
+def use_filter_responses(monkeypatch, *responses):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(config, "FILTER_BATCH_SIZE", 2)
+    call = MagicMock(side_effect=list(responses))
+    monkeypatch.setattr(synthesizer, "_call_gemini", call)
+    return call
+
+
+def ids(items):
+    return [i["id"] for i in items]
+
+
+def test_filter_deals_items_across_batches_and_merges_ranks(monkeypatch):
+    call = use_filter_responses(monkeypatch, '["d", "a"]', '["e", "b"]', '["c"]')
+
+    kept, assessed = synthesizer.filter_items([make_item(i) for i in "abcde"])
+
+    assert call.call_count == 3
+    assert ids(kept) == ["d", "e", "c", "a", "b"]
+    assert sorted(ids(assessed)) == list("abcde")
+
+
+def test_filter_returns_partial_results_when_models_run_out(monkeypatch):
+    call = use_filter_responses(
+        monkeypatch, '["a"]', synthesizer.ModelsUnavailable("down"), '["c"]'
+    )
+
+    kept, assessed = synthesizer.filter_items([make_item(i) for i in "abcd"])
+
+    assert call.call_count == 2
+    assert ids(kept) == ["a"]
+    assert ids(assessed) == ["a", "c"]
+
+
+def test_filter_skips_batch_with_unusable_response(monkeypatch):
+    use_filter_responses(monkeypatch, "not json", '{"id": "b"}', '["c"]')
+
+    kept, assessed = synthesizer.filter_items([make_item(i) for i in "abcde"])
+
+    assert ids(kept) == ["c"]
+    assert ids(assessed) == ["c"]
+
+
+def test_filter_raises_when_no_batch_succeeds(monkeypatch):
+    use_filter_responses(monkeypatch, synthesizer.ModelsUnavailable("down"))
+
+    with pytest.raises(synthesizer.ModelsUnavailable):
+        synthesizer.filter_items([make_item(i) for i in "abc"])
 
 
 def test_filter_uses_model_ranking_and_ignores_unknown_ids(monkeypatch):
@@ -364,7 +447,9 @@ def test_filter_uses_model_ranking_and_ignores_unknown_ids(monkeypatch):
         synthesizer, "_call_gemini", lambda *a, **k: '["b", "made-up", "a", "b"]'
     )
     items = [make_item("a"), make_item("b"), make_item("spam")]
-    assert [i["id"] for i in synthesizer.filter_items(items)] == ["b", "a"]
+    kept, assessed = synthesizer.filter_items(items)
+    assert ids(kept) == ["b", "a"]
+    assert ids(assessed) == ["a", "b", "spam"]
 
 
 def test_select_top_balances_sources_and_respects_limit():
@@ -465,6 +550,29 @@ def test_main_leaves_items_unmarked_when_synthesis_fails(monkeypatch):
 
     assert main.main() == 1
     assert not db.is_item_seen("arxiv:1")
+    assert digests() == []
+
+
+def test_main_leaves_unassessed_items_for_next_run(monkeypatch):
+    done, later = make_item("arxiv:done"), make_item("arxiv:later")
+    use_fetchers(monkeypatch, arxiv=lambda: [done, later])
+    monkeypatch.setattr(synthesizer, "filter_items", lambda _items: ([done], [done]))
+
+    assert main.main() == 0
+
+    assert db.is_item_seen("arxiv:done")
+    assert not db.is_item_seen("arxiv:later")
+    assert "1 items could not be assessed" in digests()[0].read_text(encoding="utf-8")
+
+
+def test_main_marks_assessed_items_when_filter_discards_all(monkeypatch):
+    spam = make_item("arxiv:spam")
+    use_fetchers(monkeypatch, arxiv=lambda: [spam])
+    monkeypatch.setattr(synthesizer, "filter_items", lambda _items: ([], [spam]))
+
+    assert main.main() == 0
+
+    assert db.is_item_seen("arxiv:spam")
     assert digests() == []
 
 

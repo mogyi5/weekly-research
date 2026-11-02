@@ -29,7 +29,7 @@ def collect_items() -> tuple[list[dict], list[str]]:
     return list(items.values()), failed
 
 
-def write_digest(body: str, failed_sources: list[str]) -> Path:
+def write_digest(body: str, failed_sources: list[str], deferred: int = 0) -> Path:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     config.DIGESTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,8 +42,13 @@ def write_digest(body: str, failed_sources: list[str]) -> Path:
         run += 1
 
     text = f"# Research Digest: {today}\n\n{body.strip()}\n"
+    notes = []
     if failed_sources:
-        text += f"\n---\n*Sources unavailable for this run: {', '.join(failed_sources)}.*\n"
+        notes.append(f"Sources unavailable for this run: {', '.join(failed_sources)}.")
+    if deferred:
+        notes.append(f"{deferred} items could not be assessed and are left for the next run.")
+    if notes:
+        text += "\n---\n" + "\n\n".join(f"*{note}*" for note in notes) + "\n"
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -71,20 +76,21 @@ def main() -> int:
     # Nothing is marked as seen until the digest is saved, so a failed LLM call
     # leaves these items available to the next run.
     try:
-        kept = synthesizer.filter_items(new_items)
+        kept, assessed = synthesizer.filter_items(new_items)
+        deferred = len(new_items) - len(assessed)
         if kept:
             selected = synthesizer.select_top(kept)
             logger.info("Kept %d items, using %d", len(kept), len(selected))
-            path = write_digest(synthesizer.synthesize_digest(selected), failed)
+            path = write_digest(synthesizer.synthesize_digest(selected), failed, deferred)
             logger.info("Saved %s", path)
         else:
-            logger.info("Filter discarded every new item; no digest written")
+            logger.info("Filter discarded every assessed item; no digest written")
     except Exception:
         logger.exception("Synthesis failed; items left unmarked for the next run")
         return 1
 
-    db.mark_items_seen(new_items)
-    logger.info("Marked %d items as seen", len(new_items))
+    db.mark_items_seen(assessed)
+    logger.info("Marked %d items as seen, left %d for next run", len(assessed), deferred)
     return 0
 
 

@@ -1,8 +1,10 @@
 """Two-phase LLM step: filter out noise, then write the digest."""
 import json
 import logging
+import math
 import os
 import time
+from dataclasses import dataclass
 from itertools import zip_longest
 
 import httpx
@@ -57,22 +59,44 @@ def has_api_key() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
-def _call_gemini(prompt: str, json_output: bool = False) -> str:
+class ModelsUnavailable(Exception):
+    """No model answered within the attempts and time allowed."""
+
+
+@dataclass
+class _Phase:
+    """The models still worth trying and the time limits for one phase of a run."""
+
+    models: list[str]
+    timeout: int
+    deadline: float
+
+    @classmethod
+    def start(cls, models: list[str], timeout: int, budget: int) -> "_Phase":
+        return cls(list(models), timeout, time.monotonic() + budget)
+
+
+def _call_gemini(prompt: str, phase: _Phase, json_output: bool = False) -> str:
     from google import genai
     from google.genai import errors, types
 
     client = genai.Client(
         api_key=os.environ["GEMINI_API_KEY"],
-        http_options=types.HttpOptions(timeout=config.LLM_TIMEOUT_SECONDS * 1000),
+        http_options=types.HttpOptions(timeout=phase.timeout * 1000),
     )
     generation_config = types.GenerateContentConfig(
         response_mime_type="application/json" if json_output else "text/plain"
     )
     last_error = None
-    for model in [config.GEMINI_MODEL, *config.GEMINI_FALLBACK_MODELS]:
+    while phase.models:
+        model = phase.models[0]
         for attempt in range(config.LLM_MAX_ATTEMPTS):
-            if attempt:
-                time.sleep(config.LLM_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
+            delay = config.LLM_RETRY_DELAY_SECONDS * 2 ** (attempt - 1) if attempt else 0
+            if time.monotonic() + delay > phase.deadline:
+                phase.models.clear()
+                raise ModelsUnavailable(f"time budget used up; last error: {last_error}")
+            if delay:
+                time.sleep(delay)
             try:
                 response = client.models.generate_content(
                     model=model, contents=prompt, config=generation_config
@@ -80,18 +104,22 @@ def _call_gemini(prompt: str, json_output: bool = False) -> str:
             except (errors.APIError, httpx.TransportError) as exc:
                 # Transport errors (timeouts, dropped connections) have no status.
                 status = getattr(exc, "code", None)
-                if status is not None and status != 429 and status < 500:
-                    raise
                 last_error = exc
                 logger.warning(
                     "%s failed with %s (attempt %d of %d)",
                     model, status or type(exc).__name__, attempt + 1, config.LLM_MAX_ATTEMPTS,
                 )
+                if status == 404:  # Retired model: move on, retrying cannot help.
+                    break
+                if status is not None and status != 429 and status < 500:
+                    raise
                 continue
             if not response.text:
                 raise ValueError("Gemini returned an empty response")
             return response.text
-    raise last_error
+        # Later calls in this phase skip this model instead of failing on it again.
+        phase.models.pop(0)
+    raise ModelsUnavailable(f"all models failed; last error: {last_error}")
 
 
 def _snippets(items: list[dict]) -> str:
@@ -110,24 +138,47 @@ def _snippets(items: list[dict]) -> str:
     )
 
 
-def filter_items(items: list[dict]) -> list[dict]:
-    """Phase 1: return the items worth keeping, ranked best first."""
+def filter_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Phase 1: return (items worth keeping ranked best first, items assessed).
+
+    Items in batches that could not be assessed are in neither list, so the
+    caller can leave them for the next run.
+    """
     if not has_api_key():
         logger.warning("GEMINI_API_KEY not set; mock mode, ranking by score only")
-        return sorted(items, key=lambda i: i["score"], reverse=True)
+        return sorted(items, key=lambda i: i["score"], reverse=True), items
 
-    size = config.FILTER_BATCH_SIZE
-    batches = [items[start : start + size] for start in range(0, len(items), size)]
-    ranked = []
+    phase = _Phase.start(
+        config.FILTER_MODELS, config.FILTER_TIMEOUT_SECONDS, config.FILTER_BUDGET_SECONDS
+    )
+    # Dealing items across batches gives every batch a mix of sources and days,
+    # so a run that stops early is not missing a whole source.
+    count = math.ceil(len(items) / config.FILTER_BATCH_SIZE)
+    batches = [items[start::count] for start in range(count)]
+
+    ranked, assessed = [], []
     for number, batch in enumerate(batches, 1):
-        logger.info("Filtering batch %d of %d", number, len(batches))
-        ranked.append(_filter_batch(batch))
+        logger.info("Filtering batch %d of %d", number, count)
+        try:
+            ranked.append(_filter_batch(batch, phase))
+        except ModelsUnavailable as exc:
+            logger.warning("Stopping at batch %d of %d: %s", number, count, exc)
+            break
+        except ValueError as exc:
+            logger.warning("Skipping batch %d, unusable response: %s", number, exc)
+            continue
+        assessed.extend(batch)
+    if not assessed:
+        raise ModelsUnavailable("no filter batch succeeded")
     # Ranks are only comparable within a batch, so take each batch's best in turn.
-    return [item for tier in zip_longest(*ranked) for item in tier if item is not None]
+    kept = [item for tier in zip_longest(*ranked) for item in tier if item is not None]
+    return kept, assessed
 
 
-def _filter_batch(items: list[dict]) -> list[dict]:
-    kept_ids = json.loads(_call_gemini(FILTER_PROMPT + _snippets(items), json_output=True))
+def _filter_batch(items: list[dict], phase: _Phase) -> list[dict]:
+    kept_ids = json.loads(_call_gemini(FILTER_PROMPT + _snippets(items), phase, json_output=True))
+    if not isinstance(kept_ids, list) or not all(isinstance(i, str) for i in kept_ids):
+        raise ValueError("expected a JSON array of ids")
     by_id = {i["id"]: i for i in items}
     return [by_id[item_id] for item_id in dict.fromkeys(kept_ids) if item_id in by_id]
 
@@ -182,4 +233,7 @@ def synthesize_digest(items: list[dict]) -> str:
         {k: i[k] for k in ("source", "title", "url", "summary", "score", "published_at")}
         for i in items
     ]
-    return _call_gemini(DIGEST_PROMPT + json.dumps(payload, ensure_ascii=False))
+    phase = _Phase.start(
+        config.DIGEST_MODELS, config.DIGEST_TIMEOUT_SECONDS, config.DIGEST_BUDGET_SECONDS
+    )
+    return _call_gemini(DIGEST_PROMPT + json.dumps(payload, ensure_ascii=False), phase)
